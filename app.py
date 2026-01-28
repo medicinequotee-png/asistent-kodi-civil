@@ -1,24 +1,18 @@
-import os
+import hashlib
+import io
 import re
-from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import hnswlib
 import numpy as np
 import pdfplumber
-import requests
 import streamlit as st
 from sklearn.decomposition import TruncatedSVD
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.preprocessing import normalize
 
-DEFAULT_PDF_PATH = "Kodi_Civill-2014_i_azhornuar-1.pdf"
 DEFAULT_TOP_K = 5
 DEFAULT_SNIPPET_LEN = 700
-DEFAULT_LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://api.openai.com/v1")
-DEFAULT_EMBED_MODEL = os.getenv("LLM_EMBED_MODEL", "text-embedding-3-small")
-DEFAULT_CHAT_MODEL = os.getenv("LLM_CHAT_MODEL", "gpt-4o-mini")
-MAX_CONTEXT_CHARS = 6000
 
 
 def clean_text(text: str) -> str:
@@ -65,78 +59,26 @@ def split_articles(full_text: str) -> List[Dict[str, str]]:
     return articles
 
 
+def is_pdf_bytes(data: bytes) -> bool:
+    return data[:5] == b"%PDF-"
+
+
+def hash_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
 @st.cache_data(show_spinner=False)
-def load_articles(pdf_path: str) -> List[Dict[str, str]]:
-    if not os.path.exists(pdf_path):
-        raise FileNotFoundError(f"Missing PDF: {pdf_path}")
+def load_articles_from_bytes(pdf_bytes: bytes, pdf_hash: str) -> List[Dict[str, str]]:
+    if not is_pdf_bytes(pdf_bytes):
+        raise ValueError("File nuk eshte PDF i vlefshem (mungon header %PDF).")
 
     pages_text: List[str] = []
-    with pdfplumber.open(pdf_path) as pdf:
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         for page in pdf.pages:
             pages_text.append(clean_text(page.extract_text() or ""))
 
     full_text = "\n".join(pages_text)
     return split_articles(full_text)
-
-
-def download_pdf(url: str, dest_path: str) -> None:
-    resp = requests.get(url, stream=True, timeout=60)
-    resp.raise_for_status()
-    with open(dest_path, "wb") as f:
-        for chunk in resp.iter_content(chunk_size=1024 * 1024):
-            if chunk:
-                f.write(chunk)
-
-
-def get_pdf_signature(pdf_path: str) -> str:
-    stat = os.stat(pdf_path)
-    return f"{stat.st_size}_{int(stat.st_mtime)}"
-
-
-def cache_dir() -> Path:
-    path = Path(".cache")
-    path.mkdir(exist_ok=True)
-    return path
-
-
-def safe_slug(value: str) -> str:
-    value = value or "default"
-    value = re.sub(r"[^a-zA-Z0-9._-]+", "_", value)
-    return value.strip("_").lower() or "default"
-
-
-def normalize_base_url(base_url: str) -> str:
-    base = (base_url or "").strip().rstrip("/")
-    if not base.endswith("/v1"):
-        base += "/v1"
-    return base
-
-
-def get_api_key() -> Optional[str]:
-    return os.getenv("LLM_API_KEY") or os.getenv("OPENAI_API_KEY")
-
-
-def embed_texts_llm(
-    texts: List[str],
-    api_key: str,
-    base_url: str,
-    model: str,
-    batch_size: int = 64,
-) -> np.ndarray:
-    url = normalize_base_url(base_url) + "/embeddings"
-    headers = {"Authorization": f"Bearer {api_key}"}
-    embeddings: List[List[float]] = []
-
-    for start in range(0, len(texts), batch_size):
-        batch = texts[start : start + batch_size]
-        payload = {"model": model, "input": batch}
-        resp = requests.post(url, headers=headers, json=payload, timeout=90)
-        resp.raise_for_status()
-        data = resp.json().get("data", [])
-        data = sorted(data, key=lambda item: item.get("index", 0))
-        embeddings.extend([item["embedding"] for item in data])
-
-    return np.asarray(embeddings, dtype=np.float32)
 
 
 def build_dense_from_tfidf(tfidf_matrix) -> Tuple[np.ndarray, Optional[TruncatedSVD]]:
@@ -160,14 +102,7 @@ def build_ann_index(dense_vectors: np.ndarray) -> hnswlib.Index:
 
 
 @st.cache_resource(show_spinner=False)
-def build_indices(
-    articles: List[Dict[str, str]],
-    use_llm_embeddings: bool,
-    llm_key_present: bool,
-    embed_model: str,
-    embed_base_url: str,
-    pdf_sig: str,
-) -> Dict[str, object]:
+def build_indices(articles: List[Dict[str, str]], pdf_hash: str) -> Dict[str, object]:
     corpus = [a["text"] for a in articles]
     if not corpus:
         raise ValueError("No articles found in PDF.")
@@ -176,30 +111,14 @@ def build_indices(
     tfidf = vectorizer.fit_transform(corpus)
     tfidf_norm = normalize(tfidf)
 
-    api_key = get_api_key() if use_llm_embeddings and llm_key_present else None
-    embeddings = None
-    svd = None
-
-    if api_key:
-        cache_key = f"{pdf_sig}_{safe_slug(embed_model)}"
-        emb_path = cache_dir() / f"embeddings_{cache_key}.npy"
-        if emb_path.exists():
-            embeddings = np.load(emb_path)
-        else:
-            embeddings = embed_texts_llm(corpus, api_key, embed_base_url, embed_model)
-            np.save(emb_path, embeddings)
-    else:
-        embeddings, svd = build_dense_from_tfidf(tfidf)
-
+    embeddings, svd = build_dense_from_tfidf(tfidf)
     ann_index = build_ann_index(embeddings)
 
     return {
         "vectorizer": vectorizer,
         "tfidf_norm": tfidf_norm,
         "svd": svd,
-        "embeddings": embeddings,
         "ann_index": ann_index,
-        "llm_embeddings": bool(api_key),
     }
 
 
@@ -215,21 +134,7 @@ def parse_article_query(q: str) -> Optional[str]:
     return None
 
 
-def embed_query(
-    query: str,
-    vectorizer: TfidfVectorizer,
-    svd: Optional[TruncatedSVD],
-    llm_enabled: bool,
-    embed_model: str,
-    embed_base_url: str,
-) -> np.ndarray:
-    if llm_enabled:
-        api_key = get_api_key()
-        if not api_key:
-            raise ValueError("LLM API key missing.")
-        vec = embed_texts_llm([query], api_key, embed_base_url, embed_model)
-        return normalize(vec)
-
+def embed_query(query: str, vectorizer: TfidfVectorizer, svd: Optional[TruncatedSVD]) -> np.ndarray:
     tfidf_vec = vectorizer.transform([query])
     if svd is None:
         dense = tfidf_vec.toarray()
@@ -245,23 +150,13 @@ def search_hybrid(
     tfidf_norm,
     ann_index: hnswlib.Index,
     svd: Optional[TruncatedSVD],
-    llm_enabled: bool,
-    embed_model: str,
-    embed_base_url: str,
     alpha: float = 0.65,
 ) -> List[Tuple[int, float]]:
     tfidf_query = vectorizer.transform([query])
     tfidf_query = normalize(tfidf_query)
     lexical_scores = (tfidf_norm @ tfidf_query.T).toarray().ravel()
 
-    q_embed = embed_query(
-        query,
-        vectorizer,
-        svd,
-        llm_enabled,
-        embed_model,
-        embed_base_url,
-    )
+    q_embed = embed_query(query, vectorizer, svd)
     labels, distances = ann_index.knn_query(q_embed, k=min(top_k * 3, len(lexical_scores)))
     semantic_scores = {int(lbl): 1.0 - float(dist) for lbl, dist in zip(labels[0], distances[0])}
 
@@ -285,96 +180,50 @@ def format_snippet(text: str, limit: int) -> str:
     return text[:limit].rsplit(" ", 1)[0] + "..."
 
 
-def build_context(articles: List[Dict[str, str]], results: List[Tuple[int, float]]) -> Tuple[str, List[str]]:
-    blocks: List[str] = []
-    citations: List[str] = []
-    total = 0
-    for idx, _score in results:
-        art = articles[idx]
-        block = f"[{art['label']}] {art['text']}"
-        if total + len(block) > MAX_CONTEXT_CHARS:
-            break
-        blocks.append(block)
-        citations.append(art["label"])
-        total += len(block)
-    return "\n\n".join(blocks), citations
-
-
-def call_chat_llm(messages: List[Dict[str, str]], api_key: str, base_url: str, model: str) -> str:
-    url = normalize_base_url(base_url) + "/chat/completions"
-    headers = {"Authorization": f"Bearer {api_key}"}
-    payload = {"model": model, "messages": messages, "temperature": 0.2}
-    resp = requests.post(url, headers=headers, json=payload, timeout=90)
-    resp.raise_for_status()
-    data = resp.json()
-    choices = data.get("choices", [])
-    if not choices:
-        raise ValueError("No response from LLM.")
-    return choices[0]["message"]["content"].strip()
-
-
 def fallback_answer(results: List[Tuple[int, float]], articles: List[Dict[str, str]]) -> str:
     if not results:
         return "Nuk gjeta nene te pershtatshme."
     top = results[0][0]
     art = articles[top]
-    return (
-        f"Nuk ka LLM te konfiguruar. Neni me relevant duket: {art['label']} - {art['title']}."
-    )
+    return f"Neni me relevant duket: {art['label']} - {art['title']}."
 
 
 st.set_page_config(page_title="Asistent Kodi Civil", layout="wide")
 st.title("Asistent Kodi Civil")
-st.caption("Bashkebisedim ne shqip dhe kerkime mbi Kodin Civil.")
+st.caption("Kerkim semantik dhe gjetje e shpejte e neneve nga PDF.")
 
 with st.sidebar:
     st.subheader("Opsione")
-    pdf_path = st.text_input("PDF path", DEFAULT_PDF_PATH)
-    pdf_url = st.text_input("PDF source URL (optional)", os.getenv("PDF_SOURCE_URL", ""))
-
-    if st.button("Shkarko / Perditeso PDF") and pdf_url:
-        try:
-            download_pdf(pdf_url, pdf_path)
-            st.success("PDF u perditesua.")
-        except Exception as exc:
-            st.error(f"Deshtoi shkarkimi: {exc}")
-
+    uploaded_pdf = st.file_uploader("Ngarko PDF (vetem PDF)", type=["pdf"])
+    if uploaded_pdf is not None:
+        size_mb = len(uploaded_pdf.getbuffer()) / (1024 * 1024)
+        st.caption(f"PDF size: {size_mb:.2f} MB")
     top_k = st.slider("Rezultate", 1, 10, DEFAULT_TOP_K)
     snippet_len = st.slider("Gjatesia e fragmentit", 200, 1400, DEFAULT_SNIPPET_LEN)
     show_full = st.checkbox("Shfaq tekstin e plote", False)
-    use_llm = st.checkbox("Perdor LLM per pergjigje", True)
     alpha = st.slider("Pesha semantike", 0.0, 1.0, 0.65)
-
-    with st.expander("LLM settings"):
-        api_key_input = st.text_input("LLM API key", value="", type="password")
-        base_url = st.text_input("LLM base URL", DEFAULT_LLM_BASE_URL)
-        embed_model = st.text_input("Embedding model", DEFAULT_EMBED_MODEL)
-        chat_model = st.text_input("Chat model", DEFAULT_CHAT_MODEL)
-
     st.markdown("Keshille: shkruaj `Neni 5` ose vetem `5` per ta hapur direkt.")
 
-if api_key_input:
-    os.environ["LLM_API_KEY"] = api_key_input
-
-try:
-    articles = load_articles(pdf_path)
-except Exception as exc:
-    st.error(str(exc))
+if uploaded_pdf is None:
+    st.info("Ngarko PDF per te filluar.")
     st.stop()
 
-pdf_sig = get_pdf_signature(pdf_path)
-indices = build_indices(
-    articles,
-    use_llm_embeddings=use_llm,
-    llm_key_present=bool(get_api_key()),
-    embed_model=embed_model,
-    embed_base_url=base_url,
-    pdf_sig=pdf_sig,
-)
+pdf_bytes = uploaded_pdf.getbuffer().tobytes()
+if not is_pdf_bytes(pdf_bytes):
+    st.error("Skedari nuk duket PDF i vlefshem. Provo perseri.")
+    st.stop()
 
-llm_ready = bool(get_api_key()) and use_llm
-if use_llm and not llm_ready:
-    st.warning("LLM nuk eshte aktiv. Vendos API key ose fik opsionin.")
+pdf_hash = hash_bytes(pdf_bytes)
+
+with st.spinner("Duke lexuar PDF..."):
+    try:
+        articles = load_articles_from_bytes(pdf_bytes, pdf_hash)
+    except Exception as exc:
+        st.error(str(exc))
+        st.stop()
+
+with st.spinner("Duke indeksuar..."):
+    indices = build_indices(articles, pdf_hash)
 
 if "messages" not in st.session_state:
     st.session_state.messages = []
@@ -408,46 +257,14 @@ if user_query:
         indices["tfidf_norm"],
         indices["ann_index"],
         indices["svd"],
-        indices["llm_embeddings"],
-        embed_model,
-        base_url,
         alpha=alpha,
     )
 
-    context_text, citations = build_context(articles, results)
-
-    if llm_ready:
-        system_prompt = (
-            "Ti je asistent juridik per Kodin Civil te Republikes se Shqiperise. "
-            "Pergjigju vetem me baze ne tekstin e dhene. Pergjigju ne shqip. "
-            "Nese nuk ka baze te mjaftueshme, thuaj qe nuk ka informacion."
-        )
-        user_prompt = (
-            f"Pyetja: {user_query}\n\n"
-            f"Teksti i kodit civil (me citime):\n{context_text}\n\n"
-            "Pergjigju shkurt dhe qartazi. Ne fund, jep citimet si [Neni X]."
-        )
-        try:
-            answer = call_chat_llm(
-                [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                api_key=get_api_key(),
-                base_url=base_url,
-                model=chat_model,
-            )
-        except Exception as exc:
-            answer = f"LLM error: {exc}"
-    else:
-        answer = fallback_answer(results, articles)
+    answer = fallback_answer(results, articles)
 
     st.session_state.messages.append({"role": "assistant", "content": answer})
     with st.chat_message("assistant"):
         st.write(answer)
-        if citations:
-            st.caption("Citime: " + ", ".join(citations))
-
         with st.expander("Nenet relevante"):
             for idx, score in results:
                 art = articles[idx]
