@@ -1,0 +1,25 @@
+import re
+import numpy as np
+import streamlit as st
+import pdfplumber
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.decomposition import TruncatedSVD
+import hnswlib
+
+PDF_PATH = "Kodi_Civill-2014_i_azhornuar-1.pdf"
+
+def clean_text(t: str) -> str:
+    t = (t or "").replace("\u00ad", "")
+    t = re.sub(r"[ \t]+", " ", t)
+    t = re.sub(r"\n{2,}", "\n", t)
+    return t.strip()
+
+@st.cache_data(show_spinner=False)
+def load_nenet(pdf_path: str):
+    pages_text = []
+    with pdfplumber.open(pdf_path) as pdf:
+        for page in pdf.pages:
+            pages_text.append(clean_text(page.extract_text() or ""))
+
+    full_text = "\n".join(pages_text)
+    pattern = re.compile(r"\bNeni\s+(\d+)\b", re.IGNORE
