@@ -3,12 +3,12 @@ import io
 import re
 from typing import Dict, List, Optional, Tuple
 
-import hnswlib
 import numpy as np
 import pdfplumber
 import streamlit as st
 from sklearn.decomposition import TruncatedSVD
 from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.neighbors import NearestNeighbors
 from sklearn.preprocessing import normalize
 
 DEFAULT_TOP_K = 5
@@ -91,14 +91,11 @@ def build_dense_from_tfidf(tfidf_matrix) -> Tuple[np.ndarray, Optional[Truncated
     return dense, svd
 
 
-def build_ann_index(dense_vectors: np.ndarray) -> hnswlib.Index:
-    dense_vectors = normalize(dense_vectors).astype(np.float32)
-    dim = dense_vectors.shape[1]
-    index = hnswlib.Index(space="cosine", dim=dim)
-    index.init_index(max_elements=len(dense_vectors), ef_construction=200, M=16)
-    index.add_items(dense_vectors, np.arange(len(dense_vectors)))
-    index.set_ef(50)
-    return index
+def build_nn_index(dense_vectors: np.ndarray) -> NearestNeighbors:
+    dense_vectors = normalize(dense_vectors)
+    nn = NearestNeighbors(metric="cosine", algorithm="auto")
+    nn.fit(dense_vectors)
+    return nn
 
 
 @st.cache_resource(show_spinner=False)
@@ -112,7 +109,7 @@ def build_indices(articles: List[Dict[str, str]], pdf_hash: str) -> Dict[str, ob
     tfidf_norm = normalize(tfidf)
 
     embeddings, svd = build_dense_from_tfidf(tfidf)
-    ann_index = build_ann_index(embeddings)
+    ann_index = build_nn_index(embeddings)
 
     return {
         "vectorizer": vectorizer,
@@ -148,7 +145,7 @@ def search_hybrid(
     top_k: int,
     vectorizer: TfidfVectorizer,
     tfidf_norm,
-    ann_index: hnswlib.Index,
+    ann_index: NearestNeighbors,
     svd: Optional[TruncatedSVD],
     alpha: float = 0.65,
 ) -> List[Tuple[int, float]]:
@@ -157,7 +154,9 @@ def search_hybrid(
     lexical_scores = (tfidf_norm @ tfidf_query.T).toarray().ravel()
 
     q_embed = embed_query(query, vectorizer, svd)
-    labels, distances = ann_index.knn_query(q_embed, k=min(top_k * 3, len(lexical_scores)))
+    distances, labels = ann_index.kneighbors(
+        q_embed, n_neighbors=min(top_k * 3, len(lexical_scores))
+    )
     semantic_scores = {int(lbl): 1.0 - float(dist) for lbl, dist in zip(labels[0], distances[0])}
 
     candidate_ids = set(np.argsort(lexical_scores)[-top_k * 3 :])
