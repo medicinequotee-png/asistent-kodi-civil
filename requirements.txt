@@ -1,6 +1,5 @@
 streamlit
 pdfplumber==0.11.9
-pypdfium2==5.30.0
 pdfminer.six==20250506
 scikit-learn==1.5.1
 hnswlib==0.8.0
