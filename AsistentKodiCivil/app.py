@@ -1,18 +1,23 @@
 import re
+import os
 import numpy as np
 import streamlit as st
 import pdfplumber
+
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.decomposition import TruncatedSVD
 from sklearn.neighbors import NearestNeighbors
 
-PDF_PATH = "Kodi_Civill-2014_i_azhornuar-1.pdf"
+# 📌 Smart path: gjen PDF-në në të njëjtin folder ku është app.py
+PDF_PATH = os.path.join(os.path.dirname(__file__), "Kodi_Civill-2014_i_azhornuar-1.pdf")
+
 
 def clean_text(t: str) -> str:
     t = (t or "").replace("\u00ad", "")
     t = re.sub(r"[ \t]+", " ", t)
     t = re.sub(r"\n{2,}", "\n", t)
     return t.strip()
+
 
 @st.cache_data(show_spinner=False)
 def load_nenet(pdf_path: str):
@@ -22,6 +27,7 @@ def load_nenet(pdf_path: str):
             pages_text.append(clean_text(page.extract_text() or ""))
 
     full_text = "\n".join(pages_text)
+
     pattern = re.compile(r"\bNeni\s+(\d+)\b", re.IGNORECASE)
     matches = list(pattern.finditer(full_text))
 
@@ -33,12 +39,19 @@ def load_nenet(pdf_path: str):
             "neni": int(m.group(1)),
             "text": full_text[start:end].strip()
         })
+
     return nenet
+
 
 @st.cache_resource(show_spinner=False)
 def build_retriever(nenet):
     texts = [n["text"] for n in nenet]
-    vectorizer = TfidfVectorizer(lowercase=True, max_features=20000, ngram_range=(1,2))
+
+    vectorizer = TfidfVectorizer(
+        lowercase=True,
+        max_features=20000,
+        ngram_range=(1, 2)
+    )
     X = vectorizer.fit_transform(texts)
 
     svd = TruncatedSVD(n_components=300, random_state=42)
@@ -48,6 +61,7 @@ def build_retriever(nenet):
     nn.fit(X_svd)
 
     return vectorizer, svd, nn
+
 
 def make_answer(query, nenet, vectorizer, svd, nn):
     q = vectorizer.transform([query])
@@ -63,23 +77,29 @@ def make_answer(query, nenet, vectorizer, svd, nn):
 
     cites = []
     for idx in indices[0]:
-        txt = nenet[idx]["text"].replace("\n"," ")
+        txt = nenet[idx]["text"].replace("\n", " ")
         if len(txt) > 200:
             txt = txt[:200] + "..."
         cites.append(f"- (Neni {nenet[idx]['neni']}) {txt}")
 
     return summary + "\n\nNenet referente:\n" + "\n".join(cites)
 
+
+# ---------------- UI ----------------
+st.set_page_config(page_title="Asistent i Kodit Civil (Shqip)", layout="centered")
 st.title("Asistent i Kodit Civil (Shqip)")
 st.caption("Kërkim inteligjent mbi nenet e Kodit Civil")
 
-nenet = load_nenet(PDF_PATH)
+try:
+    nenet = load_nenet(PDF_PATH)
+except FileNotFoundError:
+    st.error("Nuk u gjet PDF-ja. Sigurohu që 'Kodi_Civill-2014_i_azhornuar-1.pdf' është në të njëjtin folder me app.py.")
+    st.stop()
+
 vectorizer, svd, nn = build_retriever(nenet)
 
-q = st.text_input("Shkruaj pyetjen:")
+q = st.text_input("Shkruaj pyetjen (p.sh. 'Çfarë është kontrata?'):")
+
 if q:
     answer = make_answer(q, nenet, vectorizer, svd, nn)
     st.write(answer)
-
-
-
