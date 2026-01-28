@@ -23,3 +23,4 @@ def load_nenet(pdf_path: str):
 
     full_text = "\n".join(pages_text)
     pattern = re.compile(r"\bNeni\s+(\d+)\b", re.IGNORE
+
